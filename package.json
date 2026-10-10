@@ -24,6 +24,9 @@
     "rss": "node scripts/generateRss.js",
     "deadlinks": "node scripts/deadLinkChecker.js",
     "copyright": "node scripts/copyright.js",
+    "sandpack:build": "node sandpack-bundler/build.mjs",
+    "sandpack:serve": "node sandpack-bundler/serve.mjs",
+    "sandpack:mirror": "node sandpack-bundler/mirror.mjs",
     "test:eslint-local-rules": "yarn --cwd eslint-local-rules test"
   },
   "dependencies": {

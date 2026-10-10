@@ -14,6 +14,7 @@ import * as React from 'react';
 import {SandpackProvider} from '@codesandbox/sandpack-react/unstyled';
 import {SandpackLogLevel} from '@codesandbox/sandpack-client';
 import {CustomPreset} from './CustomPreset';
+import {getBundlerURL} from './bundlerURL';
 import {createFileMap} from './createFileMap';
 import {CustomTheme} from './Themes';
 import {template} from './template';
@@ -102,7 +103,7 @@ function SandpackRoot(props: SandpackProps) {
           autorun,
           initMode: 'user-visible',
           initModeObserverOptions: {rootMargin: '1400px 0px'},
-          bundlerURL: 'https://786946de.sandpack-bundler-4bw.pages.dev',
+          bundlerURL: getBundlerURL(),
           logLevel: SandpackLogLevel.None,
         }}>
         <CustomPreset providedFiles={Object.keys(files)} />

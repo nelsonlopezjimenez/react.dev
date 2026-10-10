@@ -1,0 +1,694 @@
+diff --git a/src/FileSystem/layers/NodeModuleFSLayer.ts b/src/FileSystem/layers/NodeModuleFSLayer.ts
+index fffd824..6e9d563 100644
+--- a/src/FileSystem/layers/NodeModuleFSLayer.ts
++++ b/src/FileSystem/layers/NodeModuleFSLayer.ts
+@@ -1,56 +1,14 @@
+ import { ModuleRegistry } from '../../bundler/module-registry';
+-import { retryFetch } from '../../utils/fetch';
++import { fetchPackageFiles, getPackageFile } from '../../bundler/module-registry/npm-registry';
+ import { FSLayer } from '../FSLayer';
+ 
+ const MODULE_PATH_RE = /^\/node_modules\/(@[^/]+\/[^/]+|[^@/]+)(.*)$/;
+ 
+-function getUnpkgSpecifier(moduleName: string, moduleVersion: string, path: string): string {
+-  return `${moduleName}@${moduleVersion}/${path}`;
+-}
+-
+ export class NodeModuleFSLayer extends FSLayer {
+-  private unpkgPromises: Map<string, Promise<string>> = new Map();
+-  private unpkgCache: Map<string, string | false> = new Map();
+-
+   constructor(private registry: ModuleRegistry) {
+     super('node-module-fs');
+   }
+ 
+-  async _fetchUnpkgFile(specifier: string): Promise<string> {
+-    try {
+-      const response = await retryFetch(`https://unpkg.com/${specifier}`, { maxRetries: 5 });
+-      const content = await response.text();
+-      this.unpkgCache.set(specifier, content);
+-      return content;
+-    } catch (err) {
+-      this.unpkgCache.set(specifier, false);
+-      throw err;
+-    }
+-  }
+-
+-  fetchUnpkgFile(moduleName: string, moduleVersion: string, path: string): Promise<string> {
+-    const specifier = getUnpkgSpecifier(moduleName, moduleVersion, path);
+-    const cachedContent = this.unpkgCache.get(specifier);
+-    if (typeof cachedContent === 'string') {
+-      return Promise.resolve(cachedContent);
+-    } else if (cachedContent === false) {
+-      return Promise.reject('unpkg file not found');
+-    }
+-
+-    const promise = this.unpkgPromises.get(specifier) || this._fetchUnpkgFile(specifier);
+-    this.unpkgPromises.set(specifier, promise);
+-    return promise;
+-  }
+-
+-  getUnpkgFile(moduleName: string, moduleVersion: string, path: string): string {
+-    const specifier = getUnpkgSpecifier(moduleName, moduleVersion, path);
+-    const cachedContent = this.unpkgCache.get(specifier);
+-    if (typeof cachedContent === 'string') {
+-      return cachedContent;
+-    }
+-    throw new Error(`File not found in unpkg cache: ${moduleName}@${moduleVersion} - ${path}`);
+-  }
+-
+   /** Turns a path into [moduleName, relativePath] */
+   private getModuleFromPath(path: string): [string, string] {
+     const parts = path.match(MODULE_PATH_RE);
+@@ -70,8 +28,10 @@ export class NodeModuleFSLayer extends FSLayer {
+       if (foundFile) {
+         if (typeof foundFile === 'object') {
+           return foundFile.c;
+-        } else {
+-          return this.getUnpkgFile(moduleName, module.version, modulePath);
++        }
++        const content = getPackageFile(moduleName, module.version, modulePath);
++        if (content !== undefined) {
++          return content;
+         }
+       }
+     }
+@@ -87,8 +47,11 @@ export class NodeModuleFSLayer extends FSLayer {
+         if (typeof foundFile === 'object') {
+           return foundFile.c;
+         }
+-
+-        return this.fetchUnpkgFile(moduleName, module.version, modulePath);
++        const files = await fetchPackageFiles(moduleName, module.version);
++        const content = files.get(modulePath);
++        if (content !== undefined) {
++          return content;
++        }
+       }
+     }
+     throw new Error(`Module ${path} not found`);
+diff --git a/src/bundler/module-registry/module-cdn.ts b/src/bundler/module-registry/module-cdn.ts
+index 6700b08..afdc422 100644
+--- a/src/bundler/module-registry/module-cdn.ts
++++ b/src/bundler/module-registry/module-cdn.ts
+@@ -1,10 +1,5 @@
+-import { decode as decodeMsgPack } from '@msgpack/msgpack';
+-import urlJoin from 'url-join';
+-
+-import { retryFetch } from '../../utils/fetch';
+ import { DepMap } from '.';
+-
+-const CDN_ROOT = 'https://sandpack-cdn-staging.blazingly.io/';
++import { fetchPackageFiles, resolveDependencies } from './npm-registry';
+ 
+ export interface IResolvedDependency {
+   // name
+@@ -15,20 +10,9 @@ export interface IResolvedDependency {
+   d: number;
+ }
+ 
+-const CDN_VERSION = 5;
+-
+-function encodePayload(payload: string): string {
+-  return btoa(`${CDN_VERSION}(${payload})`);
+-}
+-
+ export async function fetchManifest(deps: DepMap): Promise<IResolvedDependency[]> {
+-  const encoded_manifest = encodePayload(JSON.stringify(deps));
+-  const result = await retryFetch(urlJoin(CDN_ROOT, `/dep_tree/${encoded_manifest}`), {
+-    maxRetries: 5,
+-    retryDelay: 1000,
+-  });
+-  const buffer = await result.arrayBuffer();
+-  return decodeMsgPack(buffer) as IResolvedDependency[];
++  const resolved = await resolveDependencies(deps);
++  return resolved.map(({ name, version, depth }) => ({ n: name, v: version, d: depth }));
+ }
+ 
+ export type CDNModuleFileType = ICDNModuleFile | number;
+@@ -50,9 +34,12 @@ export interface ICDNModule {
+ }
+ 
+ export async function fetchModule(name: string, version: string): Promise<ICDNModule> {
+-  const specifier = `${name}@${version}`;
+-  const encoded_specifier = encodePayload(specifier);
+-  const result = await retryFetch(urlJoin(CDN_ROOT, `/package/${encoded_specifier}`), { maxRetries: 5 });
+-  const buffer = await result.arrayBuffer();
+-  return decodeMsgPack(buffer) as ICDNModule;
++  const files = await fetchPackageFiles(name, version);
++  // Files from the registry aren't precompiled. A number marks a file that
++  // exists but is read (and transpiled) on demand through NodeModuleFSLayer.
++  const f: Record<string, CDNModuleFileType> = {};
++  for (const path of files.keys()) {
++    f[path] = 1;
++  }
++  return { f, m: [] };
+ }
+diff --git a/src/bundler/module-registry/npm-registry.ts b/src/bundler/module-registry/npm-registry.ts
+new file mode 100644
+index 0000000..272eece
+--- /dev/null
++++ b/src/bundler/module-registry/npm-registry.ts
+@@ -0,0 +1,180 @@
++// Resolves and downloads packages from an npm registry mirror instead of the
++// CodeSandbox package CDN. The mirror is served next to the bundler, under
++// /registry on the same origin, by sandpack-bundler/serve.mjs in react.dev.
++
++import { retryFetch } from '../../utils/fetch';
++import { maxSatisfying, satisfies } from './semver';
++
++export const REGISTRY_URL = `${self.location.origin}/registry`;
++
++interface PackageVersion {
++  version: string;
++  dependencies?: Record<string, string>;
++  optionalDependencies?: Record<string, string>;
++  peerDependencies?: Record<string, string>;
++  peerDependenciesMeta?: Record<string, { optional?: boolean }>;
++}
++
++interface Packument {
++  name: string;
++  'dist-tags'?: Record<string, string>;
++  versions: Record<string, PackageVersion>;
++}
++
++export interface ResolvedPackage {
++  name: string;
++  version: string;
++  depth: number;
++}
++
++const packuments: Map<string, Promise<Packument>> = new Map();
++const packageFiles: Map<string, Map<string, string>> = new Map();
++const packageDownloads: Map<string, Promise<Map<string, string>>> = new Map();
++
++function packumentURL(name: string): string {
++  // Scoped packages are requested as `@scope%2fname`, like the npm CLI does.
++  return `${REGISTRY_URL}/${name.replace('/', '%2f')}`;
++}
++
++export function fetchPackument(name: string): Promise<Packument> {
++  let promise = packuments.get(name);
++  if (!promise) {
++    promise = retryFetch(packumentURL(name), {
++      // Ask for the smaller "abbreviated" metadata, falling back to the full document.
++      headers: { Accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*' },
++      maxRetries: 3,
++    })
++      .then((res) => res.json() as Promise<Packument>)
++      .catch((err) => {
++        packuments.delete(name);
++        throw new Error(
++          `Could not load package "${name}" from ${REGISTRY_URL}. If it's missing from the package mirror, run \`yarn sandpack:mirror\`. ${
++            err?.message ?? err
++          }`
++        );
++      });
++    packuments.set(name, promise);
++  }
++  return promise;
++}
++
++export function resolveVersion(packument: Packument, spec: string): string {
++  const { name, versions } = packument;
++  const tags = packument['dist-tags'] ?? {};
++  const range = spec.trim();
++  if (range === '' || range === '*') {
++    if (tags.latest && versions[tags.latest]) {
++      return tags.latest;
++    }
++  }
++  if (tags[range] && versions[tags[range]]) {
++    return tags[range];
++  }
++  if (versions[range]) {
++    return range;
++  }
++  if (/^(npm:|file:|link:|git|https?:|github:)/.test(range) || range.includes('/')) {
++    throw new Error(`Unsupported version "${spec}" for "${name}": only versions, ranges and dist-tags work`);
++  }
++  // Like npm, prefer the `latest` tag when it satisfies the range.
++  if (tags.latest && versions[tags.latest] && satisfies(tags.latest, range)) {
++    return tags.latest;
++  }
++  const version = maxSatisfying(Object.keys(versions), range);
++  if (!version) {
++    throw new Error(
++      `No version of "${name}" in ${REGISTRY_URL} matches "${spec}". To add it to the package mirror, run \`yarn sandpack:mirror\`.`
++    );
++  }
++  return version;
++}
++
++/**
++ * Resolves dependency ranges to a flat list of packages, breadth first.
++ * Like the CDN it replaces, it installs a single version of every package:
++ * the one closest to the root wins.
++ */
++export async function resolveDependencies(deps: Record<string, string>): Promise<ResolvedPackage[]> {
++  const resolved: Map<string, ResolvedPackage> = new Map();
++  let level: Array<[string, string]> = Object.entries(deps);
++  let depth = 0;
++
++  while (level.length) {
++    const next: Array<[string, string]> = [];
++    await Promise.all(
++      level.map(async ([name, spec]) => {
++        if (resolved.has(name)) {
++          return;
++        }
++        const entry: ResolvedPackage = { name, version: '', depth };
++        resolved.set(name, entry);
++
++        const packument = await fetchPackument(name);
++        entry.version = resolveVersion(packument, spec);
++        const pkg = packument.versions[entry.version];
++
++        const optional = pkg.optionalDependencies ?? {};
++        for (const [dep, range] of Object.entries(pkg.dependencies ?? {})) {
++          if (!(dep in optional)) {
++            next.push([dep, range]);
++          }
++        }
++        for (const [dep, range] of Object.entries(pkg.peerDependencies ?? {})) {
++          if (!pkg.peerDependenciesMeta?.[dep]?.optional) {
++            next.push([dep, range]);
++          }
++        }
++      })
++    );
++    level = next;
++    depth++;
++  }
++
++  return Array.from(resolved.values());
++}
++
++// A package as prepared by the mirror (sandpack-bundler/mirror.mjs in
++// react.dev). JavaScript files are already CommonJS, and `deps` lists the
++// require() specifiers of each one, so the browser doesn't run Babel on them.
++interface PreparedPackage {
++  files: Record<string, string>;
++  deps: Record<string, string[]>;
++}
++
++const precompiledDeps: Map<string, string[]> = new Map();
++
++function preparedPackageURL(name: string, version: string): string {
++  return `${REGISTRY_URL}/${name}/-/${name.split('/').pop()}-${version}.json`;
++}
++
++/** Downloads a package. Its files are then available through getPackageFile. */
++export function fetchPackageFiles(name: string, version: string): Promise<Map<string, string>> {
++  const key = `${name}@${version}`;
++  let promise = packageDownloads.get(key);
++  if (!promise) {
++    promise = (async () => {
++      const response = await retryFetch(preparedPackageURL(name, version), { maxRetries: 3 });
++      const prepared = (await response.json()) as PreparedPackage;
++      const files: Map<string, string> = new Map(Object.entries(prepared.files));
++      for (const [path, deps] of Object.entries(prepared.deps)) {
++        precompiledDeps.set(`/node_modules/${name}/${path}`, deps);
++      }
++      packageFiles.set(key, files);
++      return files;
++    })().catch((err) => {
++      packageDownloads.delete(key);
++      throw new Error(`Could not download ${key} from ${REGISTRY_URL}: ${err?.message ?? err}`);
++    });
++    packageDownloads.set(key, promise);
++  }
++  return promise;
++}
++
++export function getPackageFile(name: string, version: string, path: string): string | undefined {
++  return packageFiles.get(`${name}@${version}`)?.get(path);
++}
++
++/** The require() specifiers of a precompiled package file, or undefined if it needs transpiling. */
++export function getPrecompiledDeps(filepath: string): string[] | undefined {
++  return precompiledDeps.get(filepath);
++}
+diff --git a/src/bundler/module-registry/semver.ts b/src/bundler/module-registry/semver.ts
+new file mode 100644
+index 0000000..f0ab514
+--- /dev/null
++++ b/src/bundler/module-registry/semver.ts
+@@ -0,0 +1,298 @@
++// Minimal npm-compatible semver range matching, enough to resolve dependency
++// ranges from an npm registry (exact versions, ^, ~, x-ranges, comparators,
++// hyphen ranges and ||). Prereleases follow npm's rule: they only match a
++// comparator set that names a prerelease of the same major.minor.patch.
++
++type Identifier = string | number;
++
++interface SemVer {
++  major: number;
++  minor: number;
++  patch: number;
++  pre: Identifier[];
++}
++
++type Operator = '<' | '<=' | '>' | '>=' | '=';
++
++interface Comparator {
++  op: Operator;
++  v: SemVer;
++}
++
++const FULL_RE = /^[v=\s]*(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
++const PARTIAL_RE = /^[v=]*(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
++
++function parsePre(pre: string | undefined): Identifier[] {
++  if (!pre) {
++    return [];
++  }
++  return pre.split('.').map((id) => (/^\d+$/.test(id) ? Number(id) : id));
++}
++
++export function parse(version: string): SemVer | null {
++  const m = version.trim().match(FULL_RE);
++  if (!m) {
++    return null;
++  }
++  return { major: +m[1], minor: +m[2], patch: +m[3], pre: parsePre(m[4]) };
++}
++
++function compareIdentifiers(a: Identifier, b: Identifier): number {
++  const aNum = typeof a === 'number';
++  const bNum = typeof b === 'number';
++  if (aNum && bNum) {
++    return (a as number) - (b as number);
++  }
++  if (aNum) {
++    return -1;
++  }
++  if (bNum) {
++    return 1;
++  }
++  return a < b ? -1 : a > b ? 1 : 0;
++}
++
++export function compare(a: SemVer, b: SemVer): number {
++  const main = a.major - b.major || a.minor - b.minor || a.patch - b.patch;
++  if (main !== 0) {
++    return main;
++  }
++  if (!a.pre.length && !b.pre.length) {
++    return 0;
++  }
++  if (!a.pre.length) {
++    return 1;
++  }
++  if (!b.pre.length) {
++    return -1;
++  }
++  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
++    if (a.pre[i] === undefined) {
++      return -1;
++    }
++    if (b.pre[i] === undefined) {
++      return 1;
++    }
++    const c = compareIdentifiers(a.pre[i], b.pre[i]);
++    if (c !== 0) {
++      return c;
++    }
++  }
++  return 0;
++}
++
++function v(major: number, minor: number, patch: number, pre: Identifier[] = []): SemVer {
++  return { major, minor, patch, pre };
++}
++
++// The lowest possible prerelease of a version, used for exclusive upper bounds.
++function floor(major: number, minor: number, patch: number): SemVer {
++  return v(major, minor, patch, [0]);
++}
++
++interface Partial {
++  major: number | null;
++  minor: number | null;
++  patch: number | null;
++  pre: Identifier[];
++}
++
++function parsePartial(input: string): Partial | null {
++  const m = input.match(PARTIAL_RE);
++  if (!m) {
++    return null;
++  }
++  const num = (s: string | undefined) => (s === undefined || /^[xX*]$/.test(s) ? null : Number(s));
++  const major = num(m[1]);
++  const minor = major === null ? null : num(m[2]);
++  const patch = minor === null ? null : num(m[3]);
++  return { major, minor, patch, pre: patch === null ? [] : parsePre(m[4]) };
++}
++
++function lowerBound(p: Partial): SemVer {
++  return v(p.major ?? 0, p.minor ?? 0, p.patch ?? 0, p.pre);
++}
++
++// Exclusive upper bound of an x-range such as `1`, `1.2` or `1.2.x`.
++function xRangeUpper(p: Partial): SemVer | null {
++  if (p.major === null) {
++    return null;
++  }
++  if (p.minor === null) {
++    return floor(p.major + 1, 0, 0);
++  }
++  return floor(p.major, p.minor + 1, 0);
++}
++
++function expandToken(token: string): Comparator[] | null {
++  if (token === '' || token === '*' || token === 'x' || token === 'X') {
++    return [];
++  }
++
++  const opMatch = token.match(/^(\^|~>?|<=|>=|<|>|=)?(.*)$/)!;
++  const op = opMatch[1] ?? '';
++  const p = parsePartial(opMatch[2]);
++  if (!p) {
++    return null;
++  }
++  if (p.major === null) {
++    return op === '<' || op === '>' ? [{ op: '<', v: floor(0, 0, 0) }] : [];
++  }
++  const lower = lowerBound(p);
++
++  if (op === '^') {
++    let upper: SemVer;
++    if (p.major > 0 || p.minor === null) {
++      upper = floor(p.major + 1, 0, 0);
++    } else if (p.minor > 0 || p.patch === null) {
++      upper = floor(0, p.minor + 1, 0);
++    } else {
++      upper = floor(0, 0, p.patch + 1);
++    }
++    return [
++      { op: '>=', v: lower },
++      { op: '<', v: upper },
++    ];
++  }
++
++  if (op === '~' || op === '~>') {
++    const upper = p.minor === null ? floor(p.major + 1, 0, 0) : floor(p.major, p.minor + 1, 0);
++    return [
++      { op: '>=', v: lower },
++      { op: '<', v: upper },
++    ];
++  }
++
++  const isPartial = p.minor === null || p.patch === null;
++  if (op === '' || op === '=') {
++    if (!isPartial) {
++      return [{ op: '=', v: lower }];
++    }
++    return [
++      { op: '>=', v: lower },
++      { op: '<', v: xRangeUpper(p)! },
++    ];
++  }
++
++  if (!isPartial) {
++    return [{ op: op as Operator, v: lower }];
++  }
++  // Comparators with partial versions, e.g. `>1.2` means `>=1.3.0`.
++  switch (op) {
++    case '>':
++      return [{ op: '>=', v: xRangeUpper(p)! }];
++    case '>=':
++      return [{ op: '>=', v: lower }];
++    case '<':
++      return [{ op: '<', v: floor(lower.major, lower.minor, 0) }];
++    case '<=':
++      return [{ op: '<', v: xRangeUpper(p)! }];
++  }
++  return null;
++}
++
++function parseComparatorSet(input: string): Comparator[] | null {
++  const hyphen = input.match(/^\s*(\S+)\s+-\s+(\S+)\s*$/);
++  if (hyphen) {
++    const from = parsePartial(hyphen[1]);
++    const to = parsePartial(hyphen[2]);
++    if (!from || !to) {
++      return null;
++    }
++    const result: Comparator[] = [];
++    if (from.major !== null) {
++      result.push({ op: '>=', v: lowerBound(from) });
++    }
++    if (to.major !== null) {
++      const isPartial = to.minor === null || to.patch === null;
++      result.push(isPartial ? { op: '<', v: xRangeUpper(to)! } : { op: '<=', v: lowerBound(to) });
++    }
++    return result;
++  }
++
++  // Allow whitespace between an operator and its version, e.g. `>= 1.2.3`.
++  const tokens = input.trim().replace(/(\^|~>?|<=|>=|<|>|=)\s+/g, '$1').split(/\s+/);
++  const result: Comparator[] = [];
++  for (const token of tokens) {
++    const comparators = expandToken(token);
++    if (!comparators) {
++      return null;
++    }
++    result.push(...comparators);
++  }
++  return result;
++}
++
++function test(c: Comparator, version: SemVer): boolean {
++  const cmp = compare(version, c.v);
++  switch (c.op) {
++    case '<':
++      return cmp < 0;
++    case '<=':
++      return cmp <= 0;
++    case '>':
++      return cmp > 0;
++    case '>=':
++      return cmp >= 0;
++    case '=':
++      return cmp === 0;
++  }
++}
++
++function testSet(set: Comparator[], version: SemVer): boolean {
++  if (!set.every((c) => test(c, version))) {
++    return false;
++  }
++  if (!version.pre.length) {
++    return true;
++  }
++  return set.some(
++    (c) =>
++      c.v.pre.length > 0 &&
++      c.v.major === version.major &&
++      c.v.minor === version.minor &&
++      c.v.patch === version.patch
++  );
++}
++
++/** Returns the comparator sets of a range, or null if the range is not valid. */
++export function parseRange(range: string): Comparator[][] | null {
++  const sets: Comparator[][] = [];
++  for (const part of range.split('||')) {
++    const set = parseComparatorSet(part);
++    if (!set) {
++      return null;
++    }
++    sets.push(set);
++  }
++  return sets;
++}
++
++export function satisfies(version: string, range: string): boolean {
++  const parsed = parse(version);
++  const sets = parseRange(range);
++  if (!parsed || !sets) {
++    return false;
++  }
++  return sets.some((set) => testSet(set, parsed));
++}
++
++export function maxSatisfying(versions: string[], range: string): string | null {
++  const sets = parseRange(range);
++  if (!sets) {
++    return null;
++  }
++  let best: SemVer | null = null;
++  let bestRaw: string | null = null;
++  for (const raw of versions) {
++    const parsed = parse(raw);
++    if (!parsed || !sets.some((set) => testSet(set, parsed))) {
++      continue;
++    }
++    if (!best || compare(parsed, best) > 0) {
++      best = parsed;
++      bestRaw = raw;
++    }
++  }
++  return bestRaw;
++}
+diff --git a/src/bundler/presets/react/ReactPreset.ts b/src/bundler/presets/react/ReactPreset.ts
+index c6295e8..f732ceb 100644
+--- a/src/bundler/presets/react/ReactPreset.ts
++++ b/src/bundler/presets/react/ReactPreset.ts
+@@ -3,6 +3,7 @@ import { DepMap } from '../../module-registry';
+ import { Module } from '../../module/Module';
+ import { BabelTransformer } from '../../transforms/babel';
+ import { CSSTransformer } from '../../transforms/css';
++import { PrecompiledTransformer } from '../../transforms/precompiled';
+ import { ReactRefreshTransformer } from '../../transforms/react-refresh';
+ import { StyleTransformer } from '../../transforms/style';
+ import { Preset } from '../Preset';
+@@ -22,10 +23,15 @@ export class ReactPreset extends Preset {
+       this.registerTransformer(new ReactRefreshTransformer()),
+       this.registerTransformer(new CSSTransformer()),
+       this.registerTransformer(new StyleTransformer()),
++      this.registerTransformer(new PrecompiledTransformer()),
+     ]);
+   }
+ 
+   mapTransformers(module: Module): Array<[string, any]> {
++    if (PrecompiledTransformer.canTransform(module.filepath)) {
++      return [['precompiled-transformer', {}]];
++    }
++
+     if (/^(?!\/node_modules\/).*\.(((m|c)?jsx?)|tsx)$/.test(module.filepath)) {
+       return [
+         [
+diff --git a/src/bundler/transforms/precompiled/index.ts b/src/bundler/transforms/precompiled/index.ts
+new file mode 100644
+index 0000000..1e96a39
+--- /dev/null
++++ b/src/bundler/transforms/precompiled/index.ts
+@@ -0,0 +1,24 @@
++import { getPrecompiledDeps } from '../../module-registry/npm-registry';
++import { ITranspilationContext, ITranspilationResult, Transformer } from '../Transformer';
++
++/**
++ * Package files the registry mirror already compiled to CommonJS. They're
++ * used as they are, with the require() specifiers the mirror recorded, so the
++ * Babel worker only handles the sandbox's own code.
++ */
++export class PrecompiledTransformer extends Transformer {
++  constructor() {
++    super('precompiled-transformer');
++  }
++
++  static canTransform(filepath: string): boolean {
++    return getPrecompiledDeps(filepath) !== undefined;
++  }
++
++  async transform(ctx: ITranspilationContext): Promise<ITranspilationResult> {
++    return {
++      code: ctx.code,
++      dependencies: new Set(getPrecompiledDeps(ctx.module.filepath) ?? []),
++    };
++  }
++}

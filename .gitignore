@@ -49,3 +49,9 @@ public/rss.xml
 
 # Generated OG images (scripts/generateOgImages.mjs)
 public/images/og/
+
+# Offline Sandpack bundler (sandpack-bundler/build.mjs)
+sandpack-bundler/.src/
+sandpack-bundler/dist/
+sandpack-bundler/registry/
+sandpack-bundler/.registry-new/
