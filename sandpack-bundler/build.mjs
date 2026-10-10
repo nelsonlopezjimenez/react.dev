@@ -12,7 +12,7 @@
  */
 
 import {spawnSync} from 'node:child_process';
-import {existsSync, rmSync} from 'node:fs';
+import {existsSync, readFileSync, rmSync} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -47,7 +47,21 @@ run('git', ['checkout', '--quiet', '--force', '--detach', COMMIT], src);
 // Remove files added by a previous run of the patch. Ignored files such as
 // node_modules stay, so rebuilding doesn't reinstall everything.
 run('git', ['clean', '--quiet', '-d', '--force'], src);
-run('git', ['apply', '../bundler.patch'], src);
+// The bundler's sources have LF line endings. A checkout with
+// core.autocrlf=true may give the patch CRLF ones, so normalize it first.
+console.log('> git apply ../bundler.patch');
+const patch = readFileSync(join(here, 'bundler.patch'), 'utf8').replace(
+  /\r\n/g,
+  '\n'
+);
+const applied = spawnSync('git', ['apply', '-'], {
+  cwd: src,
+  input: patch,
+  stdio: ['pipe', 'inherit', 'inherit'],
+});
+if (applied.status !== 0) {
+  process.exit(applied.status ?? 1);
+}
 
 run('yarn', ['install', '--frozen-lockfile', '--ignore-scripts'], src);
 
